@@ -16,21 +16,33 @@ from datasets.panoptic_eval import PanopticEvaluator
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0, frame_skipping: bool = False):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
+    print_freq = 50
 
+    if frame_skipping: 
+        # For frame skipping
+        processed_frames = 0
+        total_frames = 0
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-        outputs = model(samples)
+        # outputs = model(samples)
+        # For frame skipping
+        if frame_skipping:
+            frame_ids = torch.tensor([t['frame_id'] for t in targets]).to(device)
+            outputs = model(samples, frame_ids)
+            processed_frames += torch.sum(outputs['frame_mask']).item()
+            total_frames += len(outputs['frame_mask'])
+        else:
+            outputs = model(samples)
         loss_dict = criterion(outputs, targets)
+       
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
@@ -61,11 +73,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
+    if frame_skipping: 
+        # For frame skipping: print processed frame count
+        print("Processed frames: {}/{}".format(processed_frames, total_frames))
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir):
+def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir, frame_skipping=False):
     model.eval()
     criterion.eval()
 
@@ -84,12 +99,23 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             data_loader.dataset.ann_folder,
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
-
+    if frame_skipping: 
+        # For frame skipping
+        processed_frames = 0
+        total_frames = 0
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        outputs = model(samples)
+         # For frame skipping
+        if frame_skipping:
+            frame_ids = torch.tensor([t['frame_id'] for t in targets]).to(device) 
+            outputs = model(samples)
+            processed_frames += torch.sum(outputs['frame_mask']).item()
+            total_frames += len(outputs['frame_mask'])
+        else:
+            outputs = model(samples)
+
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
@@ -135,6 +161,10 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     if coco_evaluator is not None:
         coco_evaluator.accumulate()
         coco_evaluator.summarize()
+    if frame_skipping: 
+        # For frame skipping: print processed frame count
+        print("Processed frames: {}/{}".format(processed_frames, total_frames))
+    
     panoptic_res = None
     if panoptic_evaluator is not None:
         panoptic_res = panoptic_evaluator.summarize()

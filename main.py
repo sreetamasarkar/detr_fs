@@ -21,7 +21,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=2, type=int)
+    parser.add_argument('--batch_size', default=4, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--lr_drop', default=200, type=int)
@@ -29,6 +29,8 @@ def get_args_parser():
                         help='gradient clipping max norm')
 
     # Model parameters
+    parser.add_argument('--num_classes', type=int, default=None,
+                        help="Number of classes in dataset+1")
     parser.add_argument('--frozen_weights', type=str, default=None,
                         help="Path to the pretrained model. If set, only the mask head will be trained")
     # * Backbone
@@ -60,6 +62,9 @@ def get_args_parser():
     parser.add_argument('--masks', action='store_true',
                         help="Train segmentation head if the flag is provided")
 
+    # Frame skipping
+    parser.add_argument('--frame_skipping', action='store_true',
+                        help="Train while skipping frames if the flag is provided")    
     # Loss
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                         help="Disables auxiliary decoding losses (loss at each layer)")
@@ -77,10 +82,11 @@ def get_args_parser():
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--eos_coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
+    parser.add_argument('--frame_count_loss_coef', default=1, type=float)
 
     # dataset parameters
-    parser.add_argument('--dataset_file', default='coco')
-    parser.add_argument('--coco_path', type=str)
+    parser.add_argument('--dataset_file', default='kitti_tracking', choices=['coco', 'kitti_tracking'])
+    parser.add_argument('--coco_path', type=str, default='/data1/COCO')
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
 
@@ -128,13 +134,23 @@ def main(args):
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
-    param_dicts = [
-        {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and p.requires_grad]},
-        {
-            "params": [p for n, p in model_without_ddp.named_parameters() if "backbone" in n and p.requires_grad],
-            "lr": args.lr_backbone,
-        },
-    ]
+    if not args.frame_skipping:
+        param_dicts = [
+            {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and p.requires_grad]},
+            {
+                "params": [p for n, p in model_without_ddp.named_parameters() if "backbone" in n and p.requires_grad],
+                "lr": args.lr_backbone,
+            },
+        ]
+    else:
+        # Remove decision threshold from parameters before loading checkpoint
+        param_dicts = [
+            {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and "threshold" not in n and p.requires_grad]},
+            {
+                "params": [p for n, p in model_without_ddp.named_parameters() if "backbone" in n and "threshold" not in n and p.requires_grad],
+                "lr": args.lr_backbone,
+            },
+        ]
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
@@ -146,7 +162,10 @@ def main(args):
         sampler_train = DistributedSampler(dataset_train)
         sampler_val = DistributedSampler(dataset_val, shuffle=False)
     else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        if not args.frame_skipping:
+            sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        else:
+            sampler_train = torch.utils.data.SequentialSampler(dataset_train) # For frame skipping
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     batch_sampler_train = torch.utils.data.BatchSampler(
@@ -173,17 +192,42 @@ def main(args):
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
+            if checkpoint["model"]["class_embed.weight"].shape[0] != args.num_classes:
+                print("=> WARNING: pretrained model has {} classes but "
+                      "the config file specifies {} classes. "
+                      "Proceeding anyway...".format(
+                          checkpoint["model"]["class_embed.weight"].shape[0], args.num_classes))
+                # Remove class weights
+                del checkpoint["model"]["class_embed.weight"]
+                del checkpoint["model"]["class_embed.bias"]
+            # SaveOGH
+            # torch.save(checkpoint,
+                    # 'detr-r50_no-class-head.pth')
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        #TODO: remove strict=False and include specific conditions (strict=False used for loading last layer with different num of classes)
+        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
+        if args.frame_skipping:
+            # Add decision threshold and pixel threshold to optimizer parameters after loading checkpoint
+            # Run one step to get pixel threshold parameter
+            for samples, targets in data_loader_train:
+                samples = samples.to(device)
+                outputs = model(samples)
+                break
+            
+            param_dicts_threshold = {
+                "params": [p for n, p in model_without_ddp.named_parameters() if "threshold" in n and p.requires_grad],
+                "lr": 0.01,
+            }
+            optimizer.add_param_group(param_dicts_threshold)
 
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                              data_loader_val, base_ds, device, args.output_dir)
+                                              data_loader_val, base_ds, device, args.output_dir, args.frame_skipping)
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         return
@@ -195,7 +239,7 @@ def main(args):
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm)
+            args.clip_max_norm, args.frame_skipping)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -212,7 +256,7 @@ def main(args):
                 }, checkpoint_path)
 
         test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args.frame_skipping
         )
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
