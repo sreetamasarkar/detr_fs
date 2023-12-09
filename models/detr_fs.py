@@ -2,6 +2,7 @@
 """
 DETR model and criterion classes.
 """
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -17,51 +18,128 @@ from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
 from .transformer import build_transformer
 
-class MaskFrame(torch.autograd.Function): 
-    @staticmethod
-    def forward(ctx, input, last_batch, pixel_threshold, decision_threshold, frame_ids):
-        cur_input = input.tensors
-        if last_batch is None:
-            last_batch = torch.zeros(input.tensors.shape).cuda()
-        # if last_batch[0].shape != cur_input[0].shape:
-        #     # Get the dimensions of images from both batches
-        #     height1, width1 = last_batch.size(2), last_batch.size(3)
-        #     height2, width2 = cur_input.size(2), cur_input.size(3)
-        #     # Calculate the padding and cropping sizes for height and width
-        #     pad_height = max(0, height2 - height1)
-        #     pad_width = max(0, width2 - width1)
-        #     crop_height = min(height1, height2)
-        #     crop_width = min(width1, width2)
-        #     # If last batch image is smaller than cur batch, pad with zeros
-        #     if pad_height > 0 or pad_width > 0:
-        #         last_batch = torch.nn.functional.pad(last_batch, (0, pad_width, 0, pad_height), value=0.0)
-        #     # If img1 is larger than img2, crop img1 to match the size of img2
-        #     if crop_height < height1 or crop_width < width1:
-        #         last_batch = last_batch[:, :, :crop_height, :crop_width]
+class ThresholdFunc(torch.autograd.Function):
 
-        prev_input = torch.cat((last_batch[-1].unsqueeze(0), cur_input[:-1]), dim=0)
+	@staticmethod
+	def forward(ctx, input):
+		# ctx.save_for_backward(input)
+		out = torch.zeros_like(input).cuda()
+		out[input > 1.0] = 1.0
+		return out
+
+	@staticmethod
+	def backward(ctx, grad_output):	
+		# input, = ctx.saved_tensors
+		grad_input = grad_output.clone()
+		# grad = STDB.alpha * torch.exp(-1*last_spike)**STDB.beta
+		return grad_input
+
+class GetSubnet(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, scores, k, frame_ids):
+        # Get the supermask by sorting the scores and using the top k%
+        out = scores.clone()
+        _, idx = scores.flatten().sort()
+        j = int((1 - k) * scores.numel())
+
+        if 0 not in idx[:j]:
+            j = j-1
+        if 1 in frame_ids:
+            if (frame_ids == 1).nonzero().squeeze() in idx[:j]:
+                j = j-1
+        # flat_out and out access the same memory.
+        flat_out = out.flatten()
+        flat_out[idx[:j]] = 0
+        flat_out[idx[j:]] = 1
+        flat_out[0] = 1 # always process the first frame of the batch for our implementation
+        flat_out[frame_ids == 1] = 1 # always process the first frame of each sequence
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        # send the gradient g straight-through on the backward pass.
+        return g, None, None
+            
+class MaskFrame(nn.Module): 
+    def __init__(self):
+        super().__init__()
+        self.threshold_func = ThresholdFunc.apply
+        self.decision_threshold = torch.nn.Parameter(torch.tensor(0.1), requires_grad=False)
+        self.pixel_threshold = self.register_parameter('pixel_threshold', None)
+        self.last_batch = None
+        self.sparsity = 0.25
+        
+    def init_pixel_threshold(self, input):
+        with open('datasets/hm_train.npy', 'rb') as f:
+            hm_train = np.load(f)
+        # init_value = 1 - torch.tensor(hm_train/hm_train.max(), device=input.tensors.device) # Threshold
+        init_value = torch.tensor(hm_train/hm_train.max(), device=input.tensors.device) # Masking
+        init_value = torch.clip(init_value, min=0.01) # avoid zeros
+        self.pixel_threshold = nn.Parameter(init_value.unsqueeze(0)) # pixel threshold with 1 channel 
+        # self.pixel_threshold = nn.Parameter(0.5*torch.ones_like(input.tensors[0])) # pixel threshold with 3 channels 
+        # self.pixel_threshold = nn.Parameter(0.8*torch.ones_like(input.tensors[0][0].unsqueeze(0))) # pixel threshold with 1 channel  
+        self.delta = torch.zeros_like(input.tensors[0][0].unsqueeze(0))
+        self.delta_masked = torch.zeros_like(input.tensors[0][0].unsqueeze(0))
+
+    def update_last_batch(self, input, frame_mask):
+        # self.last_batch = input.tensors
+        true_indices = torch.nonzero(frame_mask).flatten()
+        end_indices = torch.roll(true_indices, shifts=-1) 
+        end_indices[-1] = len(frame_mask) # last index is the length of the output
+        self.last_batch = input.tensors[true_indices.repeat_interleave(end_indices - true_indices)]
+
+    def get_prev_input(self, cur_input, frame_ids):
+        prev_input_batch = []
+        if self.last_batch is None:
+            prev_input = 0
+        else:
+            prev_input = self.last_batch[-1]
+        for i in range(len(cur_input)):
+            if frame_ids[i] == 1:
+                prev_input = torch.zeros_like(cur_input[i])
+            delta = cur_input[i] - prev_input
+            pixel_mask = torch.max(torch.abs(delta), dim=0, keepdim=True)[0] > self.pixel_threshold 
+            # pixel_mask = torch.max(torch.abs(delta), dim=0, keepdim=True)[0] * self.pixel_threshold # Masking
+            pixels_above_threshold = torch.sum(pixel_mask)/torch.prod(torch.tensor(pixel_mask.shape))
+            frame_dec = pixels_above_threshold > self.decision_threshold
+            prev_input_batch.append(prev_input.unsqueeze(0))
+            if frame_dec == 1: # update prev_input only if the frame is processed
+                prev_input = cur_input[i]
+            
+        prev_input_batch = torch.cat(prev_input_batch, dim=0)
+        return prev_input_batch
+
+    def forward(self, input, frame_ids):
+        if self.pixel_threshold is None:
+            self.init_pixel_threshold(input)
+        cur_input = input.tensors
+        prev_input = self.get_prev_input(cur_input, frame_ids)
+        # if self.last_batch is None:
+        #     self.last_batch = torch.zeros(input.tensors.shape).cuda()
+
+        # prev_input = torch.cat((self.last_batch[-1].unsqueeze(0), cur_input[:-1]), dim=0)
+        # prev_input[frame_ids == 1] = 0.0 # for first frame of each sequence, prev_input is set to 0
         x = cur_input - prev_input # prev_input is the last processed frame, cur_input is the frame being currently processed 
+        # self.delta += torch.sum(torch.max(torch.abs(x), dim=1, keepdim=True)[0], dim=0)
         # mask = torch.max(torch.abs(x), dim=1, keepdim=True)[0]
         # pixel_mask = torch.max(torch.abs(x), dim=1, keepdim=True)[0] > pixel_threshold # calculate absolute pixel wise differences 
         # tiled_mask = torch.repeat_interleave(pixel_mask, dim=1, repeats=x.shape[1])
-        pixel_mask = torch.abs(x) > pixel_threshold 
-        frame_mask = torch.sum(pixel_mask, dim=(1,2,3))/torch.prod(torch.tensor(pixel_mask.shape[1:])) > decision_threshold
-        frame_mask[frame_ids == 1] = True # always process the first frame
-        frame_mask[0] = True # always process the first frame of the batch
+        # pixel_mask = torch.abs(x) > self.pixel_threshold 
+        # Masking
+        # pixel_mask = torch.max(torch.abs(x), dim=1, keepdim=True)[0] * self.pixel_threshold
+        # Thresholding
+        pixel_mask = self.threshold_func(torch.max(torch.abs(x), dim=1, keepdim=True)[0] / self.pixel_threshold) # pixel threshold with 1 channel
+        # self.delta_masked += torch.sum(torch.max(pixel_mask, dim=1, keepdim=True)[0], dim=0)
+        # pixel_mask = self.threshold_func(torch.abs(x) / self.pixel_threshold) # pixel threshold with 3 channels 
+        pixels_above_threshold = torch.sum(pixel_mask, dim=(1,2,3))/torch.prod(torch.tensor(pixel_mask.shape[1:]))
+        frame_mask = self.threshold_func(pixels_above_threshold/self.decision_threshold)
+        # frame_mask = GetSubnet.apply(pixels_above_threshold, self.sparsity, frame_ids) 
+        frame_mask[frame_ids == 1] = 1.0 # always process the first frame of a sequence
+        frame_mask[0] = 1.0 # always process the first frame of the batch
         # TODO: save output of last batch and use it for the next batch to remove this condition
+        self.update_last_batch(input, frame_mask)
         return frame_mask
  
-		# ctx.save_for_backward(last_spike)
-		# out = torch.zeros_like(input).cuda()
-		# out[input > 0] = 1.0
-		# return out
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # last_spike, = ctx.saved_tensors
-        grad_input = grad_output.clone()
-        # grad = STDB.alpha * torch.exp(-1*last_spike)**STDB.beta
-        return grad_input, None
     
 
 class DETR(nn.Module):
@@ -86,31 +164,55 @@ class DETR(nn.Module):
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
-        self.mask_frame = MaskFrame.apply
-        self.decision_threshold = torch.nn.Parameter(torch.tensor(0.5))
-        self.pixel_threshold = self.register_parameter('pixel_threshold', None)
-        self.last_batch = None
-        
-    def init_pixel_threshold(self, input):
-        self.pixel_threshold = nn.Parameter(0.1*torch.ones_like(input.tensors[0]))  
+        self.mask_frame = MaskFrame()
+        self.last_output = None
 
-    def update_last_batch(self, input):
-        self.last_batch = input.tensors
+    def update_last_output(self, output):
+        self.last_output = output
 
-    def filter_frames(self, out, frame_mask):
+    def filter_frames(self, out, frame_mask, train=False):
+        # if not train:
         logits = out['pred_logits']
         bboxes = out['pred_boxes']
+        # if frame_mask[0] == 0:
+        #     logits[0] = self.last_output['pred_logits'][-1]
+        #     bboxes[0] = self.last_output['pred_boxes'][-1]
+        #     frame_mask[0] = 1.0
         # indices of the processed frames
-        true_indices = torch.nonzero(frame_mask).flatten() 
+        true_indices = torch.nonzero(frame_mask).flatten()
         # Create an index tensor with a shift of 1 to find the end index of each segment with same output
         end_indices = torch.roll(true_indices, shifts=-1) 
         end_indices[-1] = len(logits) # last index is the length of the output
         # Replace output of the skipped frames with the output of the last processed frame
         out['pred_logits'] = logits[true_indices.repeat_interleave(end_indices - true_indices)]
         out['pred_boxes'] = bboxes[true_indices.repeat_interleave(end_indices - true_indices)]
+        # else:
+            # # out['pred_logits'] = out['pred_logits'] * frame_mask.unsqueeze(1).unsqueeze(2)
+            # # out['pred_boxes'] = out['pred_boxes'] * frame_mask.unsqueeze(1).unsqueeze(2)
+            # logits = out['pred_logits']
+            # bboxes = out['pred_boxes']
+            # true_indices = torch.nonzero(frame_mask).flatten()
+            # # Create an index tensor with a shift of 1 to find the end index of each segment with same output
+            # end_indices = torch.roll(true_indices, shifts=-1) 
+            # end_indices[-1] = len(logits) # last index is the length of the output
+            # mask = torch.tensor(frame_mask, dtype=torch.bool).unsqueeze(1).unsqueeze(2)
+            # # new_batch_size = int(torch.sum(frame_mask).item())
+            # # out_shape = (new_batch_size, out['pred_logits'].shape[1], out['pred_logits'].shape[2])
+            # masked_logits = torch.masked_select(logits, mask)
+            # masked_bboxes = torch.masked_select(bboxes, mask)
+            # out['pred_logits'] = torch.repeat_interleave(masked_logits, (end_indices-true_indices)).view(logits.shape)
+            # out['pred_boxes'] = torch.repeat_interleave(masked_bboxes, (end_indices-true_indices)).view(bboxes.shape)
         return out
+    
+    def filter_input(self, input, frame_mask):
+        true_indices = torch.nonzero(frame_mask).flatten()
+        # Create an index tensor with a shift of 1 to find the end index of each segment with same output
+        end_indices = torch.roll(true_indices, shifts=-1) 
+        end_indices[-1] = len(frame_mask) # last index is the length of the output
+        input.tensors = input.tensors[true_indices.repeat_interleave(end_indices - true_indices)]
+        return input
 
-    def forward(self, samples: NestedTensor, frame_ids=None):
+    def forward(self, samples: NestedTensor, frame_ids=None, period=None, train=False):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -125,13 +227,30 @@ class DETR(nn.Module):
                - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
                                 dictionnaries containing the two above keys for each decoder layer.
         """
-        if self.pixel_threshold is None:
-            self.init_pixel_threshold(samples)
-        frame_mask = self.mask_frame(samples, self.last_batch, self.pixel_threshold, self.decision_threshold, frame_ids)
-
+        if period is None:
+            frame_mask = self.mask_frame(samples, frame_ids)
+        else:
+            # frame_mask = torch.ones_like(frame_ids)
+            frame_mask = torch.zeros_like(frame_ids)
+            # Define the indices for the first frame of each sequence
+            first_frame_indices =  torch.nonzero(frame_ids == 1).flatten()
+            # Set zeros at regular intervals
+            # frame_mask[period-1::period] = 0
+            frame_mask[::period] = 1
+            # Restart the pattern at specified indices
+            # for idx in first_frame_indices:
+            #     frame_mask[idx:] = 1.0
+            #     frame_mask[idx+period-1::period] = 0
+            for idx in first_frame_indices:
+                frame_mask[idx:] = 0
+                frame_mask[idx::period] = 1
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
+        
+        # samples = self.filter_input(samples, frame_mask)
         features, pos = self.backbone(samples)
+
+        # frame_mask = self.mask_frame(features[0], frame_ids)
 
         src, mask = features[-1].decompose()
         assert mask is not None
@@ -142,9 +261,9 @@ class DETR(nn.Module):
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
-        out = self.filter_frames(out, frame_mask)
+        out = self.filter_frames(out, frame_mask, train=train)
         out['frame_mask'] = frame_mask
-        self.update_last_batch(samples)
+        # self.update_last_output(out)
         return out
 
     @torch.jit.unused
@@ -275,6 +394,22 @@ class SetCriterion(nn.Module):
         losses = {'loss_frame_count': loss_frame_count}
         return losses
     
+    def fs_metrics(self, outputs, targets, indices, num_boxes, object_to_image_dt=None):
+        # Filter the matched predictions and find class labels
+        frame_id = [target['image_id'] for i, target in enumerate(targets) if outputs['frame_mask'][i] == 1.0]
+        pred_labels = [outputs['pred_logits'][i,ind[0],:].topk(1)[1] for i, ind in enumerate(indices)]
+        pred_labels = [lab.squeeze() for i, lab in enumerate(pred_labels) if outputs['frame_mask'][i] == 1.0]
+        target_labels = [target['labels'] for target in targets]
+        target_labels = [lab[ind[1]] for i, (lab, ind) in enumerate(zip(target_labels, indices)) if outputs['frame_mask'][i] == 1.0]
+        target_ids = [target['track_ids'] for i, target in enumerate(targets) if outputs['frame_mask'][i] == 1.0]
+        pred_ids = [target_id[target_labels[i] == pred_labels[i]] for i, target_id in enumerate(target_ids)]
+        img_to_obj_id = {frame_id[i]: pred_ids[i] for i in range(len(frame_id))}
+        for image_id, object_ids in img_to_obj_id.items():
+            for object_id in object_ids:
+                if object_id.item() not in object_to_image_dt:
+                    object_to_image_dt[object_id.item()] = image_id.item()
+        return object_to_image_dt
+    
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -298,7 +433,7 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
-    def forward(self, outputs, targets):
+    def forward(self, outputs, targets, object_to_image_dt=None):
         """ This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
@@ -321,6 +456,8 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+        if object_to_image_dt is not None:
+            object_to_image_dt = self.fs_metrics(outputs, targets, indices, num_boxes, object_to_image_dt)
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
@@ -337,7 +474,8 @@ class SetCriterion(nn.Module):
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
-
+        if object_to_image_dt is not None:
+            return losses, object_to_image_dt
         return losses
 
 
