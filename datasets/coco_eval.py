@@ -221,7 +221,7 @@ def evaluate(self):
     p.imgIds = list(np.unique(p.imgIds))
     if p.useCats:
         # p.catIds = list(np.unique(p.catIds))
-        p.catIds = [1,2,3]
+        p.catIds = [1,2,3] # For Kitti
     p.maxDets = sorted(p.maxDets)
     self.params = p
 
