@@ -25,6 +25,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         self.prepare = ConvertCocoPolysToMask(return_masks)
         self.class_names = ['Pedestrian', 'Car', 'Cyclist']
         self.cat_ids = {1:1, 2:2, 3:3, 4:2, 5:2, 6:1, 7:0, 8:0, 9:0}
+        # self.cat_ids = {1:0, 2:1, 3:2, 4:1, 5:1, 6:0, 7:3, 8:3, 9:3}
         self.frame_ids = self.get_frame_ids(ann_file)
         assert len(self.frame_ids) == len(self.ids), 'frame_ids and ids should have same length'
 
@@ -76,7 +77,7 @@ class ConvertCocoPolysToMask(object):
 
         anno = target["annotations"]
 
-        anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0]
+        anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0 and obj["category_id"]!=0]
 
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
@@ -87,7 +88,8 @@ class ConvertCocoPolysToMask(object):
 
         classes = [obj["category_id"] for obj in anno]
         classes = torch.tensor(classes, dtype=torch.int64)
-
+        track_ids = [obj["track_id"] for obj in anno]
+        track_ids = torch.tensor(track_ids, dtype=torch.int64)
         if self.return_masks:
             segmentations = [obj["segmentation"] for obj in anno]
             masks = convert_coco_poly_to_mask(segmentations, h, w)
@@ -103,6 +105,7 @@ class ConvertCocoPolysToMask(object):
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0]) & (classes != 0)
         boxes = boxes[keep]
         classes = classes[keep]
+        track_ids = track_ids[keep]
         if self.return_masks:
             masks = masks[keep]
         if keypoints is not None:
@@ -111,6 +114,7 @@ class ConvertCocoPolysToMask(object):
         target = {}
         target["boxes"] = boxes
         target["labels"] = classes
+        target["track_ids"] = track_ids
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id
@@ -182,5 +186,5 @@ def build(image_set, args):
     }
 
     img_folder, ann_file = PATHS[image_set]
-    dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set, (1280, 384)), return_masks=args.masks)
+    dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set, (1280, 384)), return_masks=False)
     return dataset

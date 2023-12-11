@@ -5,7 +5,7 @@ import json
 import random
 import time
 from pathlib import Path
-
+import sys
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
@@ -16,15 +16,18 @@ from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
 from models import build_model
 
+import matplotlib.pyplot as plt
+from matplotlib import cm
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=4, type=int)
+    parser.add_argument('--lr_threshold', default=1e-5, type=float)
+    parser.add_argument('--batch_size', default=4, type=int) # For frame skipping, batch size also acts as the upper bound on number of skipped frames at a stretch
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=300, type=int)
-    parser.add_argument('--lr_drop', default=200, type=int)
+    parser.add_argument('--lr_drop', default=100, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
 
@@ -64,7 +67,8 @@ def get_args_parser():
 
     # Frame skipping
     parser.add_argument('--frame_skipping', action='store_true',
-                        help="Train while skipping frames if the flag is provided")    
+                        help="Train while skipping frames if the flag is provided")  
+    parser.add_argument('--period', default=None, type=int, help="periodic frame skipping period") # set batch size as a multiple of period
     # Loss
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                         help="Disables auxiliary decoding losses (loss at each layer)")
@@ -109,6 +113,14 @@ def get_args_parser():
 
 
 def main(args):
+    torch.autograd.set_detect_anomaly(True)
+    if args.eval:
+        args.outfile = args.output_dir + '/eval.txt'
+    else:
+        args.outfile = args.output_dir + '/output.txt'
+    f = open(args.outfile, 'w')
+    sys.stdout = f
+    
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
 
@@ -143,14 +155,21 @@ def main(args):
             },
         ]
     else:
-        # Remove decision threshold from parameters before loading checkpoint
+        # Freeze weight parameters except for maskregion network
+        for name, parameter in model.named_parameters():
+            if 'maskregion' in name:
+                print('Setting grad false for: {}'.format(name))
+                parameter.requires_grad_(False)
+
+        # Remove mask region network from parameters before loading checkpoint
         param_dicts = [
-            {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and "threshold" not in n and p.requires_grad]},
+            {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and "maskregion" not in n and p.requires_grad]},
             {
-                "params": [p for n, p in model_without_ddp.named_parameters() if "backbone" in n and "threshold" not in n and p.requires_grad],
+                "params": [p for n, p in model_without_ddp.named_parameters() if "backbone" in n and "maskregion" not in n and p.requires_grad],
                 "lr": args.lr_backbone,
             },
         ]
+      
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
@@ -188,6 +207,15 @@ def main(args):
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     output_dir = Path(args.output_dir)
+    # if args.frame_skipping:
+        # Add decision threshold and pixel threshold to optimizer parameters after loading checkpoint
+        # Run one step to get pixel threshold parameter
+        # for samples, targets in data_loader_train:
+        #     samples = samples.to(device)
+        #     frame_ids = torch.tensor([t['frame_id'] for t in targets]).to(device)
+        #     outputs = model(samples, frame_ids)
+        #     break
+
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -211,27 +239,35 @@ def main(args):
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
-        if args.frame_skipping:
-            # Add decision threshold and pixel threshold to optimizer parameters after loading checkpoint
-            # Run one step to get pixel threshold parameter
-            for samples, targets in data_loader_train:
-                samples = samples.to(device)
-                outputs = model(samples)
-                break
-            
-            param_dicts_threshold = {
-                "params": [p for n, p in model_without_ddp.named_parameters() if "threshold" in n and p.requires_grad],
-                "lr": 0.01,
-            }
-            optimizer.add_param_group(param_dicts_threshold)
+        # if args.frame_skipping:           
+        #     # param_dicts_threshold = {
+        #     #     "params": [p for n, p in model_without_ddp.named_parameters() if "threshold" in n or "scores" in n and p.requires_grad],
+        #     #     "lr": args.lr_threshold,
+        #     # }
+        #     # Train mask region network together with detr
+        #     param_dicts_threshold = {
+        #         "params": [p for n, p in model_without_ddp.named_parameters() if "maskregion" in n and p.requires_grad],
+        #         "lr": args.lr,
+        #     }
+        #     optimizer.add_param_group(param_dicts_threshold)
 
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                              data_loader_val, base_ds, device, args.output_dir, args.frame_skipping)
-        if args.output_dir:
-            utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
+                                              data_loader_val, base_ds, device, args.output_dir, args.frame_skipping, args.period)
+        # if args.output_dir:
+        #     utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
+        # pixel_threshold = model.mask_frame.pixel_threshold.squeeze(0).detach().cpu().numpy()
+        # plt.imsave(args.output_dir + 'pixel_threshold.png', pixel_threshold/pixel_threshold.max(), cmap=cm.gray)
+        # delta = model.mask_frame.delta.squeeze(0).detach().cpu().numpy()
+        # plt.imsave(args.output_dir + '/delta.png', delta/delta.max(), cmap=cm.gray)
+        # masked_delta = model.mask_frame.delta_masked.squeeze(0).detach().cpu().numpy()
+        # plt.imsave(args.output_dir + '/delta_masked.png', masked_delta/masked_delta.max(), cmap=cm.gray)
+        region_mask = model.maskregion.region_mask.squeeze(0).detach().cpu().numpy()
+        plt.imsave(args.output_dir + '/region_mask.png', region_mask, cmap=cm.gray)
         return
-
+    best_loss = 10000
+    loss_list, loss_bbox_list, loss_ce_list, loss_giou_list = [], [], [], []
+    loss_frame_count_list = []
     print("Start training")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
@@ -258,7 +294,24 @@ def main(args):
         test_stats, coco_evaluator = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args.frame_skipping
         )
+        loss_list.append(test_stats['loss'])
+        loss_bbox_list.append(test_stats['loss_bbox'])
+        loss_ce_list.append(test_stats['loss_ce'])
+        loss_giou_list.append(test_stats['loss_giou'])
+        if args.frame_skipping:
+            loss_frame_count_list.append(test_stats['loss_frame_count'])
 
+        best_checkpoint_path = output_dir / 'best_checkpoint.pth'
+        if test_stats['loss'] < best_loss:
+            best_loss = test_stats['loss']
+            utils.save_on_master({
+                    'model': model_without_ddp.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'epoch': epoch,
+                    'args': args,
+                }, best_checkpoint_path)
+            
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
@@ -281,8 +334,24 @@ def main(args):
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Minimum loss {}'.format(best_loss))
+    # pixel_threshold = model.mask_frame.pixel_threshold.squeeze(0).detach().cpu().numpy()
+    # plt.imsave(args.output_dir + 'pixel_threshold.png', pixel_threshold/pixel_threshold.max(), cmap=cm.gray)
+    # delta = model.mask_frame.delta.squeeze(0).detach().cpu().numpy()
+    # plt.imsave(args.output_dir + 'delta.png', delta/delta.max(), cmap=cm.gray)
+    if not args.eval:
+        plt.plot(loss_list, label='Loss')
+        plt.plot(loss_bbox_list, label='Bbox Loss')
+        plt.plot(loss_ce_list, label='CE Loss')
+        plt.plot(loss_giou_list, label='GIOU Loss')
+        if args.frame_skipping:
+            plt.plot(loss_frame_count_list, label='Frame Count Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.savefig(args.output_dir + '/loss.png')
     print('Training time {}'.format(total_time_str))
-
+    f.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])

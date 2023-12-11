@@ -80,7 +80,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     optimizer.step()
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
+    print("Averaged stats:", {k: meter.global_avg for k, meter in metric_logger.meters.items()})
     if frame_skipping: 
         # For frame skipping: print processed frame count
         print("Processed frames: {}/{}".format(processed_frames, total_frames))
@@ -178,7 +178,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
+    print("Averaged stats:", {k: meter.global_avg for k, meter in metric_logger.meters.items()})
     if coco_evaluator is not None:
         coco_evaluator.synchronize_between_processes()
     if panoptic_evaluator is not None:

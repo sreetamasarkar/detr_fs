@@ -58,9 +58,10 @@ class GetSubnet(torch.autograd.Function):
         return g, None
             
 class MaskRegion(nn.Module): 
-    def __init__(self, sparsity=0.5):
+    def __init__(self, sparsity=0.5, threshold=0.5):
         super(MaskRegion, self).__init__()
         self.sparsity = sparsity
+        self.threshold = threshold
         # initialize the scores
         self.scores = None
         # self.scores = self.register_parameter('scores', None)
@@ -81,6 +82,9 @@ class MaskRegion(nn.Module):
         self.init_value = torch.tensor(hm_train/hm_train.max(), device=input.tensors.device, dtype=torch.float)
         # init_value = torch.clip(init_value, min=0.01) # avoid zeros
         self.scores = self.init_value.clone().detach().unsqueeze(0) # pixel threshold with 3 channels
+        if self.region_mask_generator.new_mask is None:
+            self.region_mask_generator.init_masks(input.tensors)
+        self.region_mask_generator.update_new_mask(self.scores) 
         # self.scores = nn.Parameter(self.init_value.unsqueeze(0)) # pixel threshold with 1 channel 
         # self.scores = nn.Parameter(self.init_value[::self.region_size,::self.region_size].unsqueeze(0)) # region threshold with 1 channel 
         # self.scores = nn.Parameter(self.init_value[::self.region_size,::self.region_size].unsqueeze(0), requires_grad=False) # region threshold with 1 channel 
@@ -163,12 +167,14 @@ class MaskRegion(nn.Module):
         #------------- Mask learning on direct input -----------------
         scores = self.region_mask_generator(input.tensors, frame_ids)
         # mask = GetSubnet.apply(scores.abs(), self.sparsity)
-        mask = scores > 0.5
+        mask = scores > self.threshold # do not constrain to a fixed sparsity for every image
         region_mask = torch.repeat_interleave(torch.repeat_interleave(mask, self.region_size, dim=2), self.region_size, dim=3) # expand to image dimension
+        proxy_mask = GetSubnet.apply(self.scores.abs(), self.sparsity)
         if 1 in frame_ids:
             first_frame_id = torch.where(frame_ids==1)[0][0]
-            region_mask[first_frame_id:] = torch.ones_like(region_mask[first_frame_id:])
+            region_mask[first_frame_id:] = proxy_mask.repeat(region_mask.shape[0]-first_frame_id, 1, 1, 1)
         # region_mask[-1] = torch.ones_like(region_mask[-1]) # always process the first frame of the batch
+        region_mask[-1] = proxy_mask
         # ------------------------------------------------------------
         #-------------- Dynamic Masking with output of previous batch-----------------------
         # weight = torch.ones(1, self.scores.shape[0], self.region_size, self.region_size, device=input.tensors.device)
@@ -255,7 +261,7 @@ class DETR(nn.Module):
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
-        self.maskregion = MaskRegion(sparsity=0.2) # sparsty is the percentage of pixels to be preserved
+        self.maskregion = MaskRegion(sparsity=0.6, threshold=0.1) # sparsty is the percentage of pixels to be preserved
         self.last_batch = None
 
     def update_last_batch(self, input):
